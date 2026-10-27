@@ -1,22 +1,22 @@
 """
 autobot.py - Modern PyQt6 Autonomous AI OS Agent (A.R.C)
 Upgrades:
-1. Voice Input (🎙️ Microphone Button) -> Transcribes spoken commands and runs them step-by-step.
-2. Proactive Clarification Dialog (`prompt_dialog` / `ask_user`):
-   - If a command is ambiguous (e.g. "check my browser"), the AI opens a dialog asking "Which browser, sir?",
-     sends your answer back to the AI Brain, and continues the step-by-step plan.
-3. Self-Regenerating Step-by-Step Planner & Diagnostic Mode Selector (Text vs. Image):
-   - Breaks every task into numbered steps and executes them one by one in the visible bottom terminal.
-   - If a step fails in the terminal or screen (or when the AI needs context), asks the user whether to send
-     diagnostic context to the AI Brain as **Text** (terminal/logs) or **Image** (live screenshot + OCR),
-     then regenerates the failed step and proceeds.
+1. Interactive Step-by-Step Brain Loop with Clarification Dialogs:
+   - Breaks any user task into numbered steps (`plan`) and executes 1 step at a time.
+   - If the AI needs clarification (e.g., "Which browser, sir?"), it pops up a Qt dialog (`ask_clarification` / `ask_user`),
+     sends the user's answer back to the AI Brain, and continues the workflow.
+2. Error & Context Reporting Mode Dialog (Text vs. Screenshot Image):
+   - When an error occurs in the terminal/screen or output cannot be copied, asks the user whether to send
+     Text logs, a Screenshot Image, or Both to the AI Brain so it can regenerate and fix the failed step.
+3. Closed-Loop Visual GUI Navigation:
+   - Automatically captures screenshots + OCR element coordinates after GUI steps so the AI Brain can see
+     what is on the screen, move the mouse cursor accurately, and decide when/where to click or type.
 """
 import os
 import re
 import io
 import ast
 import sys
-import wave
 import uuid
 import glob
 import time
@@ -126,12 +126,11 @@ PIP_PACKAGE_MAP = {
     "pyautogui": "pyautogui",
     "pyperclip": "pyperclip",
     "edge_tts": "edge-tts",
-    "speech_recognition": "SpeechRecognition",
 }
 
 
 # ==========================================
-# 0. BACKEND CONSOLE STREAM TEE
+# 0. BACKEND CONSOLE STREAM TEE (CAPTURES PYTHON & C++ STDERR/STDOUT)
 # ==========================================
 class BackendConsoleCapture(QObject):
     new_log_signal = pyqtSignal(str)
@@ -239,7 +238,7 @@ class BackendConsoleWidget(QWidget):
 
 
 # ==========================================
-# 1. OS DETECTION, HUMAN NEURAL TTS, VOICE INPUT (STT), & CONFIG
+# 1. OS DETECTION, HUMAN NEURAL TTS ENGINE, CONFIG, & MEMORY.JSON
 # ==========================================
 def get_os_info():
     p = platform.system().lower()
@@ -388,90 +387,6 @@ class SpeechEngine:
         threading.Thread(target=_worker, daemon=True).start()
 
 
-class VoiceInputEngine:
-    """
-    Captures spoken voice commands from the user's microphone and transcribes them into text.
-    Uses OS audio recording (`arecord` / `ffmpeg` / `speech_recognition`) + Groq Whisper or Google STT.
-    """
-    @staticmethod
-    def record_and_transcribe(config: dict, duration_sec: int = 5) -> tuple:
-        """Returns (transcribed_text, error_or_status_msg)."""
-        wav_path = os.path.join(tempfile.gettempdir(), f"arc_voice_{int(time.time())}.wav")
-        recorded = False
-
-        # 1. Try Python speech_recognition first if installed
-        try:
-            import speech_recognition as sr
-            rec = sr.Recognizer()
-            with sr.Microphone() as source:
-                rec.adjust_for_ambient_noise(source, duration=0.4)
-                audio = rec.listen(source, timeout=5, phrase_time_limit=duration_sec + 3)
-            with open(wav_path, "wb") as f:
-                f.write(audio.get_wav_data())
-            recorded = os.path.exists(wav_path) and os.path.getsize(wav_path) > 500
-        except Exception:
-            recorded = False
-
-        # 2. Fallback to native Linux `arecord` or `ffmpeg`
-        if not recorded:
-            try:
-                if CURRENT_OS == "Linux" and shutil.which("arecord"):
-                    subprocess.run(
-                        ["arecord", "-f", "S16_LE", "-r", "16000", "-c", "1", "-d", str(duration_sec), wav_path],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=duration_sec + 3
-                    )
-                    recorded = os.path.exists(wav_path) and os.path.getsize(wav_path) > 500
-                elif shutil.which("ffmpeg"):
-                    inp_fmt = "alsa" if CURRENT_OS == "Linux" else "dshow" if CURRENT_OS == "Windows" else "avfoundation"
-                    inp_dev = "default" if CURRENT_OS == "Linux" else ":0"
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-f", inp_fmt, "-i", inp_dev, "-t", str(duration_sec), "-ar", "16000", "-ac", "1", wav_path],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=duration_sec + 4
-                    )
-                    recorded = os.path.exists(wav_path) and os.path.getsize(wav_path) > 500
-            except Exception:
-                recorded = False
-
-        if not recorded:
-            return "", "Could not record from microphone. Ensure a mic is connected (or `arecord` / `SpeechRecognition` is installed)."
-
-        try:
-            # Transcribe via Groq Whisper if Groq API key is configured
-            groq_key = (
-                config.get("api_keys_by_provider", {}).get("Groq (Official SDK)", "").strip()
-                or (config.get("api_key", "").strip() if config.get("provider") == "Groq (Official SDK)" else "")
-            )
-            if groq_key and requests and check_internet_available():
-                with open(wav_path, "rb") as f:
-                    r = requests.post(
-                        "https://api.groq.com/openai/v1/audio/transcriptions",
-                        headers={"Authorization": f"Bearer {groq_key}"},
-                        files={"file": ("voice.wav", f, "audio/wav")},
-                        data={"model": "whisper-large-v3-turbo"},
-                        timeout=25
-                    )
-                if r.status_code == 200:
-                    txt = r.json().get("text", "").strip()
-                    if txt:
-                        return txt, "Transcribed via Groq Whisper."
-
-            # Fallback to SpeechRecognition Google Web Speech API
-            import speech_recognition as sr
-            rec = sr.Recognizer()
-            with sr.AudioFile(wav_path) as source:
-                audio_data = rec.record(source)
-            txt = rec.recognize_google(audio_data)
-            return txt.strip(), "Transcribed via Google Speech Recognition."
-        except Exception as e:
-            return "", f"Voice transcription failed: {e}"
-        finally:
-            try:
-                if os.path.exists(wav_path):
-                    os.remove(wav_path)
-            except OSError:
-                pass
-
-
 PROVIDER_MODELS = {
     "Groq (Official SDK)": [
         "qwen/qwen3.8-27b",
@@ -565,7 +480,6 @@ def load_config():
 
 
 class MemoryStore:
-    """Manages persistent timestamped memories in memory.json."""
     def __init__(self, filepath=MEMORY_FILE):
         self.filepath = filepath
         self._lock = threading.RLock()
@@ -627,7 +541,6 @@ class MemoryStore:
 
 
 class ChatHistoryStore:
-    """Multi-conversation persistent store in chat_history.json."""
     def __init__(self, filepath=CHAT_HISTORY_FILE):
         self.filepath = filepath
         self._lock = threading.RLock()
@@ -817,7 +730,6 @@ class ChatHistoryStore:
 # 2. WHATSAPP / TELEGRAM CHAT BUBBLES + RIGHT-CLICK (COPY, SPEAK)
 # ==========================================
 class ChatBubbleWidget(QWidget):
-    """Single message bubble with inline attachments and Right-Click Context Menu ('Copy', 'Speak')."""
     def __init__(self, text: str, is_user: bool = True, timestamp: str = "", attachment: dict = None, parent=None):
         super().__init__(parent)
         self.raw_text = (text or "").strip()
@@ -960,7 +872,6 @@ class ChatBubbleWidget(QWidget):
 
 
 class CameraCaptureDialog(QDialog):
-    """Modal dialog to snap a photo from the webcam and send to the bot."""
     def __init__(self, camera_tracker_widget=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Capture Photo from Camera")
@@ -1056,21 +967,23 @@ class CameraCaptureDialog(QDialog):
         super().closeEvent(event)
 
 
-class DiagnosticModeDialog(QDialog):
+class ErrorReportChoiceDialog(QDialog):
     """
-    Asks the user whether A.R.C should send diagnostic / error / screen context to the AI Brain
-    as **Text** (terminal output / logs), **Image** (live screenshot + OCR), or **Both**.
+    When a command/step fails or output cannot be copied directly, asks the user how A.R.C
+    should send the diagnostic state back to the AI Brain:
+    - Send Terminal/Error Text
+    - Capture & Send Screenshot Image + OCR
+    - Send Both Text + Screenshot Image
     """
-    def __init__(self, reason_title: str, terminal_snippet: str = "", parent=None):
+    def __init__(self, step_summary: str, error_text: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("A.R.C Brain Diagnostic — Choose Format (Text or Image)")
-        self.resize(580, 310)
-        self.chosen_mode = "text"
+        self.setWindowTitle("Send Error / Screen State to AI Brain")
+        self.resize(560, 310)
+        self.choice = "both"
 
         self.setStyleSheet("""
             QDialog { background-color: #060d1a; color: #d0e6ff; font-family: 'Segoe UI'; }
-            QTextEdit { background-color: #081224; color: #ff9e9e; border: 1px solid #164068;
-                        border-radius: 6px; font-family: 'Consolas'; font-size: 12px; padding: 6px; }
+            QTextEdit { background: #091426; color: #ff9eb5; border: 1px solid #ff2d6b; border-radius: 6px; font-family: 'Consolas'; font-size: 12px; }
             QPushButton {
                 background: rgba(0, 255, 231, 0.15); border: 1px solid #00ffe7; color: #00ffe7;
                 padding: 8px 14px; border-radius: 6px; font-weight: bold; font-size: 12px;
@@ -1080,26 +993,31 @@ class DiagnosticModeDialog(QDialog):
 
         lay = QVBoxLayout(self)
         lbl = QLabel(
-            f"<b>⚠️ {reason_title}</b><br><br>"
-            "How should A.R.C send this state to the AI Brain so it can analyze & regenerate the next step?"
+            f"<b>Step encountered an issue or needs visual inspection:</b><br>"
+            f"<span style='color:#00ffe7;'>{step_summary}</span><br><br>"
+            "How should A.R.C send this error/output to the AI Brain to fix and regenerate the step?"
         )
         lbl.setWordWrap(True)
         lay.addWidget(lbl)
 
-        if terminal_snippet:
-            preview = QTextEdit()
-            preview.setReadOnly(True)
-            preview.setPlainText(terminal_snippet[-1000:])
-            lay.addWidget(preview, 1)
+        preview = QTextEdit()
+        preview.setReadOnly(True)
+        preview.setPlainText((error_text or "No text output captured (GUI/Screen state only).")[:1200])
+        lay.addWidget(preview, 1)
 
         btn_row = QHBoxLayout()
-        btn_txt = QPushButton("📄 Upload Text (Terminal / Logs)")
+        btn_txt = QPushButton("📄 Send Text Only")
         btn_txt.clicked.connect(lambda: self._pick("text"))
 
-        btn_img = QPushButton("🖼️ Upload Image (Screenshot)")
+        btn_img = QPushButton("🖼️ Send Screenshot Image")
         btn_img.clicked.connect(lambda: self._pick("image"))
 
-        btn_both = QPushButton("🔄 Upload Both (Text + Image)")
+        btn_both = QPushButton("⚡ Send Text + Screenshot (Recommended)")
+        btn_both.setStyleSheet("""
+            QPushButton { background: rgba(255, 195, 0, 0.20); border: 1px solid #ffc300; color: #ffc300;
+                          padding: 8px 14px; border-radius: 6px; font-weight: bold; }
+            QPushButton:hover { background: rgba(255, 195, 0, 0.38); }
+        """)
         btn_both.clicked.connect(lambda: self._pick("both"))
 
         btn_row.addWidget(btn_txt)
@@ -1108,12 +1026,11 @@ class DiagnosticModeDialog(QDialog):
         lay.addLayout(btn_row)
 
     def _pick(self, mode: str):
-        self.chosen_mode = mode
+        self.choice = mode
         self.accept()
 
 
 class ChatStreamWidget(QWidget):
-    """Multi-Session Chat History Panel with 3-lines (☰) fade toggle, '+ New Chat', Pin, Rename, Delete."""
     def __init__(self, history_store: ChatHistoryStore, parent=None):
         super().__init__(parent)
         self.history_store = history_store
@@ -1484,10 +1401,6 @@ class ChatStreamWidget(QWidget):
 # 3. VISIBLE BOTTOM TERMINAL WITH AI COMMAND & OUTPUT BRIDGE
 # ==========================================
 class DirectTerminalWidget(QTextEdit):
-    """
-    Interactive OS Terminal that also lets the AI paste & execute commands visibly
-    and captures output + exit code back so the AI can monitor and debug results.
-    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(520, 180)
@@ -1830,7 +1743,6 @@ def find_fuzzy_matching_files(query: str, search_dir: str, max_depth: int = 3, e
 
 
 class FileWorkspaceDialog(QDialog):
-    """Interactive dialog when the user asks to find/edit/manipulate a file or folder."""
     def __init__(self, query: str, search_dir: str, matches: list, ai_engine=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"File & Folder Workspace — Matches for '{query}'")
@@ -2131,39 +2043,35 @@ class MultiFileDeleteDialog(QDialog):
 
 
 # ==========================================
-# 5. AI ENGINE (STEP-BY-STEP PLANNER, CLARIFICATION DIALOGS, DIAGNOSTICS)
+# 5. AI ENGINE (STEP-BY-STEP PLANNER, CLARIFICATION DIALOGS, AUTO SCREEN VISION & SELF-DEBUGGING)
 # ==========================================
-SYSTEM_PROMPT = """You are A.R.C, an autonomous self-coding OS, terminal, window, and vision agent running on {OS}.
-You control:
-1. The user's visible bottom OS Terminal (`run_command`, `read_terminal`)
-2. An autonomous Python Script Generator & Executor (`write_and_run_python`) with auto-pip package installation (`install_package`)
-3. Interactive User Clarification Dialogs (`prompt_dialog`, `ask_user`):
-   - Whenever the user's request is missing a specific detail (for example, if the user says "check my browser" without saying which browser, or if you need a filename, port, or choice), DO NOT guess! First call `prompt_dialog` (e.g. `{"action":"prompt_dialog","question":"Which browser should I check, sir?","options":["Brave","Chrome","Firefox"]}`) with `"done": false`.
-   - The user's answer will be returned to you in `Observation:`, and you will then proceed step-by-step!
-4. Diagnostic Context Uploader (`send_context_to_brain`):
-   - Whenever an error appears on the terminal or screen, or text cannot be copied directly, call `{"action":"send_context_to_brain","reason":"Inspect error or screen state"}` with `"done": false`. The bot will ask the user whether to upload **Text** or **Screenshot Image** and return the full analysis to you so you can regenerate the failed step.
-5. Smart Window & Tab Management (`list_windows`, `switch_window`, `switch_tab`)
-6. Step-by-Step HTML / Code File Inspector & Editor (`ai_edit_file`, `find_and_edit_file`)
+SYSTEM_PROMPT = """You are A.R.C, an autonomous step-by-step OS, terminal, window, and visual GUI agent running on {OS}.
 
-MANDATORY STEP-BY-STEP PLANNING & SELF-REGENERATION PROTOCOL:
-1. Break every task into numbered steps inside `"plan": ["Step 1: ...", "Step 2: ..."]`.
-2. Execute 1 step (or a small group of steps) at a time with `"done": false` so you can verify the `Observation:` output.
-3. If any step fails in `Observation:`, regenerate an alternative step or command in `"steps"` and continue until the task succeeds.
-4. Set `"done": true` only when the entire task is finished.
+CORE STEP-BY-STEP EXECUTION & CLARIFICATION PROTOCOL:
+1. Break EVERY user request into a numbered `plan`: `["Step 1: ...", "Step 2: ...", ...]`.
+2. Execute ONE logical step (or small group of dependent actions) at a time with `"done": false` so you receive the real `Observation:` (terminal output, user dialog answer, or live screen OCR/vision coordinates) before deciding the next step.
+3. CLARIFICATION DIALOGS: If the user's request is ambiguous (for example, "check my browser" without saying which browser, or missing a filename/parameter), your FIRST step MUST be `ask_clarification` (or `ask_user`) to pop up a dialog box asking the user (e.g., `{"action":"ask_clarification","question":"Which browser would you like me to check, sir?","options":["Brave","Chrome","Firefox"]}`), with `"done": false`. Once you receive their answer in `Observation:`, check the running processes/windows and proceed!
+4. ERROR RECOVERY & STEP REGENERATION: If any step or command fails in `Observation:`, analyze the error + screen/terminal feedback in `"thought"`, regenerate a fixed step, and continue until the goal succeeds.
+5. VISUAL GUI NAVIGATION: Whenever you need to see what is on the screen to move the mouse or type, use `capture_and_inspect_screen` (or `screen_read` / `navigate_to_target`) with `"done": false`. The bot will auto-capture the screen, detect text/button `(x, y)` coordinates, and send them back to you so you know exactly where to move the mouse and when to type.
 
-Reply ONLY with one JSON object (no markdown fences):
+Reply ONLY with one valid JSON object (no markdown fences):
 {
-  "thought": "<your reasoning, clarification check, or error recovery>",
-  "plan": ["Step 1: ...", "Step 2: ..."],
+  "thought": "<reasoning, current step status, or error debugging>",
+  "plan": ["Step 1: ...", "Step 2: ...", "Step 3: ..."],
+  "current_step": "Step 1: ...",
   "steps": [ <actions> ],
   "done": true|false
 }
 
 AVAILABLE ACTIONS:
-Clarification & Diagnostic Actions:
- {"action":"prompt_dialog","title":"Input Needed","question":"Which browser would you like me to check, sir?","options":["Brave","Google Chrome","Firefox"]}
+Interactive Clarification & Error Reporting:
+ {"action":"ask_clarification","title":"Clarification Needed","question":"Which browser would you like me to check, sir?","options":["Brave","Google Chrome","Firefox"]}
  {"action":"ask_user","title":"Info needed","fields":[{"name":"browser","label":"Which browser, sir?","type":"text"}]}
- {"action":"send_context_to_brain","reason":"Check terminal/screen output and choose Text or Image format"}
+ {"action":"ask_error_report_mode","step_name":"Run command","error_text":"..."}
+Visual Screen Navigation & Inspection:
+ {"action":"capture_and_inspect_screen","reason":"Check visible buttons and coordinates on screen"}
+ {"action":"navigate_to_target","phrase":"Hello world","click":"none|left|right|double"}
+ {"action":"analyze_screen","question":"What is currently on my screen?"}
 Python & Package Automation:
  {"action":"write_and_run_python","filename":"create_pdf.py","description":"Create PDF report","packages":["reportlab"],"code":"from reportlab.pdfgen import canvas\\n..."}
  {"action":"install_package","package":"reportlab"}
@@ -2176,14 +2084,12 @@ Window & Tab Switching:
  {"action":"switch_tab","direction":"next|prev|index","index":1,"count":1}
 Terminal & OS Basics:
  {"action":"reply","text":"..."}
- {"action":"run_command","command":"ls -la ~/Desktop"}
+ {"action":"run_command","command":"ps aux | grep -i brave"}
  {"action":"read_terminal"}
  {"action":"remember","key":"candy","value":"I have a red candy today"}
  {"action":"delete_fuzzy","query":"probotauto","destination":"Documents/BETA"}
  {"action":"delete_path","path":"/x/y"}
  {"action":"generate_image","prompt":"a futuristic cyberpunk city at night"}
- {"action":"analyze_screen","question":"What is currently on my screen?"}
- {"action":"navigate_to_target","phrase":"Hello world","click":"none|left|right|double"}
  {"action":"timer","seconds":180,"label":"3 minute timer"}
  {"action":"alarm","time":"15:00","label":"3 PM alarm"}
  {"action":"open_app","app":"brave"}
@@ -2342,9 +2248,9 @@ class AIEngine:
             b64_img = base64.b64encode(f.read()).decode("utf-8")
 
         prompt_with_ocr = (
-            f"User Question / Context: {question}\n\n"
+            f"User / Agent Question about the screen: {question}\n\n"
             f"OCR Detected Screen Text & Coordinates:\n{ocr_summary}\n\n"
-            "Provide a clear, helpful analysis based on the screen image and OCR data."
+            "Provide a clear, actionable analysis (including button/text coordinates and any visible errors) based on the screen image and OCR data."
         )
 
         try:
@@ -2530,11 +2436,19 @@ class AIEngine:
     def offline_fallback_parser(self, text):
         t = text.lower().strip()
         words = t.split()
-        if "browser" in t and ("check" in t or "open" in t) and not any(b in t for b in ("brave", "chrome", "firefox", "edge")):
+        if "browser" in t and ("check" in t or "open" in t):
             return json.dumps({
-                "thought": "User asked to check browser without specifying which one.",
-                "plan": ["Step 1: Ask user which browser to check via dialog", "Step 2: Open or switch to the chosen browser"],
-                "steps": [{"action": "prompt_dialog", "title": "Select Browser", "question": "Which browser would you like me to check, sir?", "options": ["Brave", "Google Chrome", "Firefox"]}],
+                "thought": "User asked to check browser without specifying which one; ask via dialog first.",
+                "plan": [
+                    "Step 1: Ask the user which browser to check via a dialog box.",
+                    "Step 2: Check if the selected browser process/window is running and switch to or launch it."
+                ],
+                "steps": [{
+                    "action": "ask_clarification",
+                    "title": "Select Browser",
+                    "question": "Which browser would you like me to check, sir?",
+                    "options": ["Brave", "Google Chrome", "Firefox"]
+                }],
                 "done": False
             })
         if "timer for" in t:
@@ -3044,6 +2958,7 @@ class DynamicFormDialogQt(QDialog):
                 form.addRow("", w)
             elif kind == "choice":
                 w = QComboBox()
+                w.setEditable(True)
                 w.addItems([str(x) for x in f.get("options", [])])
                 form.addRow(label + ":", w)
             elif kind == "multiline":
@@ -3058,7 +2973,7 @@ class DynamicFormDialogQt(QDialog):
             self.widgets[f["name"]] = (kind, w, f.get("required", True))
 
         btns = QHBoxLayout()
-        btn_ok = QPushButton("Submit")
+        btn_ok = QPushButton("Submit to AI Brain →")
         btn_ok.clicked.connect(self._submit)
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
@@ -3073,7 +2988,7 @@ class DynamicFormDialogQt(QDialog):
             if kind == "checkbox":
                 val = w.isChecked()
             elif kind == "choice":
-                val = w.currentText()
+                val = w.currentText().strip()
             elif kind == "multiline":
                 val = w.toPlainText().strip()
             else:
@@ -3089,7 +3004,7 @@ class DynamicFormDialogQt(QDialog):
 # ==========================================
 # 8. MAIN PYQT6 DESKTOP AGENT WINDOW
 # ==========================================
-SAFE_COMMANDS = re.compile(r"^\s*(ls|pwd|echo|date|whoami|uname|hostname|uptime|df|free|which|dir|ver|cd|find|cat|head|tail|wmctrl|xdotool|pip|python|python3)\b[^;&|`$><]*$", re.I)
+SAFE_COMMANDS = re.compile(r"^\s*(ls|pwd|echo|date|whoami|uname|hostname|uptime|df|free|which|dir|ver|cd|find|cat|head|tail|wmctrl|xdotool|pip|python|python3|ps|pgrep)\b[^;&|`$><]*$", re.I)
 DESTRUCTIVE = re.compile(r"\b(rm|rmdir|del|erase|format|mkfs|dd|shutdown|reboot|poweroff|kill|killall|chmod|chown|mv|truncate|shred)\b|>\s*/", re.I)
 CRITICAL_UI = re.compile(r"\b(delete|remove|erase|pay|purchase|buy now|place order|confirm order|transfer|send money|close account|deactivate)\b", re.I)
 
@@ -3125,7 +3040,6 @@ class ThreadBridge(QObject):
     chat_bubble_signal = pyqtSignal(str, bool, object)
     busy_signal = pyqtSignal(bool)
     exec_main_signal = pyqtSignal(object, object, object)
-    voice_done_signal = pyqtSignal(str, str)
 
 
 class DesktopAgentWindow(QMainWindow):
@@ -3148,7 +3062,6 @@ class DesktopAgentWindow(QMainWindow):
         self.bridge.chat_bubble_signal.connect(self._append_chat_bubble_ui)
         self.bridge.busy_signal.connect(lambda b: self.btn_stop.setVisible(b))
         self.bridge.exec_main_signal.connect(self._exec_on_main_slot)
-        self.bridge.voice_done_signal.connect(self._on_voice_transcribed)
 
         self.screen = ScreenReader(self.log)
         self.web = WebAgent(self.log, self.wait_for_user)
@@ -3421,7 +3334,7 @@ class DesktopAgentWindow(QMainWindow):
         )
 
     # ==========================================
-    # CENTRAL MULTI-CHAT + PLUG + VOICE MIC BUTTON + INPUT BAR
+    # CENTRAL MULTI-CHAT + PLUG ATTACHMENT BUTTON + INPUT BAR
     # ==========================================
     def _build_central_chat_and_input(self):
         central = QWidget()
@@ -3449,8 +3362,7 @@ class DesktopAgentWindow(QMainWindow):
             "• Upload Image\n"
             "• Click Photo from Camera\n"
             "• Take Quick Screenshot (Auto-Send)\n"
-            "• Upload Any File\n"
-            "• Send Diagnostic Context (Text or Image)"
+            "• Upload Any File"
         )
         self.btn_plug.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_plug.setFixedSize(42, 42)
@@ -3469,28 +3381,9 @@ class DesktopAgentWindow(QMainWindow):
         """)
         self.btn_plug.clicked.connect(self._show_plug_attachment_menu)
 
-        self.btn_mic = QPushButton("🎙️")
-        self.btn_mic.setToolTip("Speak a voice command to A.R.C (Speech-to-Text)")
-        self.btn_mic.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_mic.setFixedSize(42, 42)
-        self.btn_mic.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(255, 195, 0, 0.14);
-                border: 1.5px solid #ffc300;
-                border-radius: 21px;
-                color: #ffc300;
-                font-size: 17px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 195, 0, 0.32);
-            }
-        """)
-        self.btn_mic.clicked.connect(self.start_voice_command_listening)
-
         self.entry_cmd = QLineEdit()
         self.entry_cmd.setPlaceholderText(
-            "Type or click 🎙️ to speak: 'check my browser', 'create a pdf on Desktop', 'switch app to brave', 'edit index.html'..."
+            "Tell A.R.C any task: 'check my browser', 'create a pdf report', 'switch app to brave', 'navigate to button Hello world'..."
         )
         self.entry_cmd.setStyleSheet("""
             QLineEdit {
@@ -3525,37 +3418,9 @@ class DesktopAgentWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_task)
 
         inp_row.addWidget(self.btn_plug)
-        inp_row.addWidget(self.btn_mic)
         inp_row.addWidget(self.entry_cmd, 1)
         inp_row.addWidget(self.btn_stop)
         lay.addLayout(inp_row)
-
-    # ==========================================
-    # VOICE COMMAND (SPEECH-TO-TEXT) HANDLER
-    # ==========================================
-    def start_voice_command_listening(self):
-        if self.busy:
-            self.show_reply("A task is currently running — press STOP first or wait.")
-            return
-        self.btn_mic.setEnabled(False)
-        self.entry_cmd.setPlaceholderText("🎙️ Listening to your voice command (speak now)...")
-
-        def _worker():
-            txt, status = VoiceInputEngine.record_and_transcribe(self.config, duration_sec=5)
-            self.bridge.voice_done_signal.emit(txt, status)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_voice_transcribed(self, text: str, status: str):
-        self.btn_mic.setEnabled(True)
-        self.entry_cmd.setPlaceholderText(
-            "Type or click 🎙️ to speak: 'check my browser', 'create a pdf on Desktop', 'switch app to brave', 'edit index.html'..."
-        )
-        if not text:
-            self.show_reply(f"🎙️ {status}")
-            return
-        self.entry_cmd.setText(text)
-        self.handle_user_command()
 
     # ==========================================
     # PLUG / ATTACHMENT MENU & HANDLERS
@@ -3565,8 +3430,6 @@ class DesktopAgentWindow(QMainWindow):
         act_img = menu.addAction("🖼️  Upload Image...")
         act_cam = menu.addAction("📷  Click Image from Camera...")
         act_shot = menu.addAction("🖥️  Take Quick Screenshot (Auto-Send)")
-        menu.addSeparator()
-        act_diag = menu.addAction("🧠  Send Terminal / Screen Diagnostic (Ask Text or Image)...")
         menu.addSeparator()
         act_file = menu.addAction(f"📎  Upload Any File (Max {MAX_FILE_SIZE_MB} MB)...")
 
@@ -3578,12 +3441,6 @@ class DesktopAgentWindow(QMainWindow):
             self._handle_click_camera_image()
         elif chosen == act_shot:
             self._handle_quick_screenshot()
-        elif chosen == act_diag:
-            threading.Thread(
-                target=self._ask_and_send_diagnostic_context,
-                args=("Manual Brain Diagnostic Check",),
-                daemon=True
-            ).start()
         elif chosen == act_file:
             self._handle_upload_any_file()
 
@@ -3850,67 +3707,45 @@ class DesktopAgentWindow(QMainWindow):
             return d.result if d.exec() == QDialog.DialogCode.Accepted else None
         return self.run_on_main(_show)
 
-    def ask_prompt_dialog(self, title: str, question: str, options: list = None) -> str:
+    def ask_error_report_mode(self, step_summary: str, error_text: str) -> str:
         """
-        Opens a dialog box asking the user for clarification (e.g., 'Which browser would you like me to check, sir?').
-        Supports either a dropdown/editable choice list or free-text input, and returns the user's answer to the AI Brain.
+        Asks the user whether to send Text, Screenshot Image, or Both to the AI Brain
+        when an error occurs or output cannot be copied directly.
         """
-        def _ask():
-            if options and isinstance(options, list) and len(options) > 0:
-                val, ok = QInputDialog.getItem(
-                    self, title or "Clarification Needed", question, [str(x) for x in options], 0, True
-                )
-            else:
-                val, ok = QInputDialog.getText(
-                    self, title or "Clarification Needed", question, QLineEdit.EchoMode.Normal
-                )
-            return val.strip() if ok and val else ""
+        def _show():
+            d = ErrorReportChoiceDialog(step_summary, error_text, self)
+            return d.choice if d.exec() == QDialog.DialogCode.Accepted else "text"
 
-        ans = self.run_on_main(_ask)
-        if ans:
-            self.bridge.chat_bubble_signal.emit(f"[Dialog Answer] {ans}", True, None)
-        return ans
+        mode = self.run_on_main(_show)
+        if mode == "text":
+            return f"Error / Terminal Output (Text Mode):\n{error_text}"
 
-    def _ask_and_send_diagnostic_context(self, reason: str, terminal_snippet: str = "") -> str:
-        """
-        Asks the user whether to upload diagnostic context to the AI Brain as Text, Image (Screenshot), or Both.
-        """
-        term_buf = terminal_snippet or self.run_on_main(lambda: self.terminal_widget.get_recent_terminal_text(2000))
+        shot_path = self._capture_clean_screenshot()
+        ocr_info = ""
+        try:
+            self.screen.scan()
+            ocr_info = self.screen.summary(40)
+        except Exception:
+            pass
 
-        def _choose_mode():
-            dlg = DiagnosticModeDialog(reason, term_buf, self)
-            return dlg.chosen_mode if dlg.exec() == QDialog.DialogCode.Accepted else "text"
+        vis_analysis = ""
+        if shot_path:
+            vis_analysis = self.ai.analyze_image_with_ai(
+                shot_path,
+                f"Analyze the screen and any visible error or UI state for step: {step_summary}",
+                ocr_info
+            )
+            att = {
+                "type": "screenshot",
+                "path": shot_path,
+                "name": os.path.basename(shot_path),
+                "size_str": self._format_bytes(os.path.getsize(shot_path))
+            }
+            self.show_reply(f"📸 Sent screen state to AI Brain for debugging:\n{vis_analysis}", attachment=att)
 
-        mode = self.run_on_main(_choose_mode)
-        out_parts = []
-
-        if mode in ("text", "both"):
-            out_parts.append(f"[Uploaded Terminal / Log Text]:\n{term_buf}")
-
-        if mode in ("image", "both"):
-            shot_path = self._capture_clean_screenshot()
-            if shot_path:
-                ocr_txt = ""
-                try:
-                    self.screen.scan()
-                    ocr_txt = self.screen.summary(35)
-                except Exception:
-                    pass
-                vis_analysis = self.ai.analyze_image_with_ai(
-                    shot_path,
-                    f"Analyze any error, dialog, or state visible on the screen for: {reason}",
-                    ocr_txt
-                )
-                att_meta = {
-                    "type": "screenshot",
-                    "path": shot_path,
-                    "name": os.path.basename(shot_path),
-                    "size_str": self._format_bytes(os.path.getsize(shot_path))
-                }
-                self.show_reply(f"📸 **Screen Diagnostic Sent to Brain:**\n{vis_analysis}", attachment=att_meta)
-                out_parts.append(f"[Uploaded Screen Image Analysis]:\n{vis_analysis}\n[Screen OCR]:\n{ocr_txt}")
-
-        return "\n\n".join(out_parts) if out_parts else "No diagnostic context captured."
+        if mode == "image":
+            return f"Screen Vision & OCR State:\n{vis_analysis}\n{ocr_info}"
+        return f"Terminal/Error Text:\n{error_text}\n\nScreen Vision & OCR State:\n{vis_analysis}\n{ocr_info}"
 
     def wait_for_user(self, message):
         def _ask():
@@ -3943,11 +3778,9 @@ class DesktopAgentWindow(QMainWindow):
     # ==========================================
     # VISIBLE BOTTOM TERMINAL EXECUTION HELPER
     # ==========================================
-    def execute_in_bottom_terminal(self, cmd: str, timeout: float = 45.0, ask_on_error: bool = True) -> str:
+    def execute_in_bottom_terminal(self, cmd: str, timeout: float = 45.0) -> tuple:
         """
-        Executes `cmd` visibly inside the bottom terminal.
-        If the command fails (non-zero exit code) and `ask_on_error` is True, asks the user
-        whether to send the error to the AI Brain as Text or Image (Screenshot) so it can regenerate the step!
+        Executes `cmd` visibly inside the bottom terminal and returns `(exit_code, formatted_output)`.
         """
         def _trigger():
             if not self.dock_terminal.isVisible():
@@ -3960,16 +3793,8 @@ class DesktopAgentWindow(QMainWindow):
         output = "".join(self.terminal_widget._ai_cmd_buffer).strip()
         code = self.terminal_widget._ai_exit_code
         status_hdr = f"[Exit Code: {code}]\n"
-        base_res = (status_hdr + output)[:3800] if output else f"{status_hdr}(command finished with no stdout)"
-
-        if code != 0 and ask_on_error:
-            diag_extra = self._ask_and_send_diagnostic_context(
-                f"Command `{cmd[:60]}` failed with Exit Code {code}",
-                terminal_snippet=base_res
-            )
-            return f"{base_res}\n\n{diag_extra}"
-
-        return base_res
+        formatted = (status_hdr + output)[:3800] if output else f"{status_hdr}(command finished with no stdout)"
+        return code, formatted
 
     # ==========================================
     # AUTONOMOUS PYTHON CODE RUNNER & AUTO-PIP MODULE INSTALLER
@@ -4005,7 +3830,8 @@ class DesktopAgentWindow(QMainWindow):
             return ""
         self.show_reply(f"📦 Auto-installing missing Python module `{clean_pkg}` via bottom terminal...")
         pip_cmd = f"\"{sys.executable}\" -m pip install {clean_pkg}"
-        return self.execute_in_bottom_terminal(pip_cmd, timeout=120.0, ask_on_error=False)
+        _code, out = self.execute_in_bottom_terminal(pip_cmd, timeout=120.0)
+        return out
 
     def execute_python_script_with_auto_install(
         self,
@@ -4040,19 +3866,17 @@ class DesktopAgentWindow(QMainWindow):
                 self.ensure_pip_package_installed(mod)
 
         run_cmd = f"\"{sys.executable}\" \"{script_path}\""
-        for attempt in range(3):
-            out = self.execute_in_bottom_terminal(run_cmd, timeout=90.0, ask_on_error=False)
+        for _attempt in range(3):
+            exit_code, out = self.execute_in_bottom_terminal(run_cmd, timeout=90.0)
             missing_pkg = self._extract_missing_module(out)
             if missing_pkg:
                 self.ensure_pip_package_installed(missing_pkg)
                 continue
-            if "[Exit Code: 0]" not in out:
-                diag_extra = self._ask_and_send_diagnostic_context(
-                    f"Python script `{filename}` encountered an error",
-                    terminal_snippet=out
-                )
-                return f"Script `{script_path}` failed:\n{out}\n\n{diag_extra}"
-            return f"Script `{script_path}` executed.\n{out}"
+            if exit_code != 0:
+                # Ask user whether to send text traceback or screenshot + text to AI Brain to regenerate the step
+                report = self.ask_error_report_mode(f"Python script {filename} failed (Exit {exit_code})", out)
+                return f"Script `{script_path}` failed.\n{report}"
+            return f"Script `{script_path}` executed successfully.\n{out}"
 
         return f"Script `{script_path}` output after auto-install retries:\n{out}"
 
@@ -4095,7 +3919,7 @@ class DesktopAgentWindow(QMainWindow):
 
         if CURRENT_OS == "Linux":
             if not shutil.which("wmctrl") and not shutil.which("xdotool"):
-                self.execute_in_bottom_terminal("sudo -n apt-get install -y wmctrl xdotool 2>/dev/null || true", timeout=15, ask_on_error=False)
+                self.execute_in_bottom_terminal("sudo -n apt-get install -y wmctrl xdotool 2>/dev/null || true", timeout=15)
 
             if shutil.which("wmctrl"):
                 try:
@@ -4112,7 +3936,7 @@ class DesktopAgentWindow(QMainWindow):
                                 break
                     if matched_wid:
                         cmd = f"wmctrl -i -a {matched_wid} && wmctrl -i -r {matched_wid} -b add,maximized_vert,maximized_horz"
-                        self.execute_in_bottom_terminal(cmd, timeout=5.0, ask_on_error=False)
+                        self.execute_in_bottom_terminal(cmd, timeout=5.0)
                         msg = f"Switched to and maximized open window: '{matched_title}' ({matched_wid})."
                         self.show_reply(f"🪟 {msg}")
                         return msg
@@ -4125,7 +3949,7 @@ class DesktopAgentWindow(QMainWindow):
                     if wids:
                         wid = wids[0]
                         cmd = f"xdotool windowactivate {wid}"
-                        self.execute_in_bottom_terminal(cmd, timeout=5.0, ask_on_error=False)
+                        self.execute_in_bottom_terminal(cmd, timeout=5.0)
                         msg = f"Activated open window matching '{app_hint}' (ID: {wid})."
                         self.show_reply(f"🪟 {msg}")
                         return msg
@@ -4140,14 +3964,14 @@ class DesktopAgentWindow(QMainWindow):
                 "Write-Output ('Switched to window: ' + $p.MainWindowTitle) "
                 "} else { Write-Output 'NOT_FOUND' }"
             )
-            out = self.execute_in_bottom_terminal(ps_script, timeout=8.0, ask_on_error=False)
+            _code, out = self.execute_in_bottom_terminal(ps_script, timeout=8.0)
             if "Switched to window:" in out:
                 self.show_reply(f"🪟 {out}")
                 return out
 
         elif CURRENT_OS == "macOS":
             osa = f'tell application "{app_hint}" to activate'
-            out = self.execute_in_bottom_terminal(f"osascript -e '{osa}'", timeout=6.0, ask_on_error=False)
+            _code, out = self.execute_in_bottom_terminal(f"osascript -e '{osa}'", timeout=6.0)
             self.show_reply(f"🪟 Activated {app_hint}.")
             return out
 
@@ -4227,7 +4051,7 @@ class DesktopAgentWindow(QMainWindow):
         search_dir = resolve_search_directory(dest_hint)
 
         if CURRENT_OS != "Windows":
-            self.execute_in_bottom_terminal(f"find \"{search_dir}\" -maxdepth 3 -iname \"*{query}*\" 2>/dev/null", ask_on_error=False)
+            self.execute_in_bottom_terminal(f"find \"{search_dir}\" -maxdepth 3 -iname \"*{query}*\" 2>/dev/null")
 
         direct_candidate = os.path.expanduser(query.strip("\"'"))
         if os.path.exists(direct_candidate):
@@ -4297,7 +4121,7 @@ class DesktopAgentWindow(QMainWindow):
         else:
             term_cmd = f"find \"{search_dir}\" -maxdepth 3 -iname \"*{clean_q}*\" 2>/dev/null"
 
-        term_out = self.execute_in_bottom_terminal(term_cmd, ask_on_error=False)
+        _code, term_out = self.execute_in_bottom_terminal(term_cmd)
 
         matches = find_fuzzy_matching_files(clean_q, search_dir, ext_filter=ext_filter)
         if not matches and os.path.exists(os.path.join(search_dir, query)):
@@ -4497,14 +4321,36 @@ class DesktopAgentWindow(QMainWindow):
                     f"Recorded on {best_m['date']} at {best_m['time']}.")
         return None
 
+    def _capture_screen_observation_for_brain(self, reason: str = "Post-step screen check") -> str:
+        """
+        Automatically captures a screenshot + OCR coordinates and returns a structured
+        summary so the AI Brain can see what's on the screen before moving the mouse or typing.
+        """
+        shot_path = self._capture_clean_screenshot()
+        ocr_text = ""
+        try:
+            self.screen.scan()
+            ocr_text = self.screen.summary(40)
+        except Exception as e:
+            ocr_text = f"(OCR note: {e})"
+
+        if shot_path and os.path.exists(shot_path):
+            vis_desc = self.ai.analyze_image_with_ai(
+                shot_path,
+                f"Inspect screen for agent navigation ({reason}). List key visible buttons, input fields, and any dialogs/errors.",
+                ocr_text
+            )
+            return f"Auto-Screen-Vision ({shot_path}):\n{vis_desc}\n\nOCR Coordinates:\n{ocr_text}"
+        return f"Screen OCR Coordinates:\n{ocr_text}"
+
     def _run_task(self, cmd):
         """
-        Step-by-step autonomous agent loop:
-        - Breaks tasks into steps (`plan`).
-        - If clarification is needed (e.g. "check my browser"), opens `prompt_dialog`, sends the user's answer
-          back to the AI Brain, and continues.
-        - If a step fails, asks the user whether to send diagnostic context as Text or Image,
-          feeds the result back to the AI Brain, regenerates the failed step, and proceeds.
+        Closed-loop step-by-step autonomous orchestrator:
+        - Breaks user request into `plan` steps.
+        - Executes step-by-step; if a step asks a clarification question via dialog (`ask_clarification` / `ask_user`),
+          feeds the user's answer back to the AI Brain.
+        - If a command or GUI step fails, asks the user whether to send Text or Screenshot Image (or both)
+          to the AI Brain so it can regenerate the failed step and continue.
         """
         self.busy = True
         self.stop_event.clear()
@@ -4554,29 +4400,47 @@ class DesktopAgentWindow(QMainWindow):
                     return
 
                 plan = data.get("plan")
+                cur_step_lbl = data.get("current_step", "")
                 steps = data.get("steps") or ([data] if "action" in data else [])
+
                 if not shown_plan and isinstance(plan, list) and len(plan) > 1 and not (len(steps) == 1 and steps[0].get("action") == "reply"):
                     shown_plan = True
                     plan_formatted = "🧠 **A.R.C Step-by-Step Plan:**\n" + "\n".join(f"  {p}" for p in plan)
                     self.show_reply(plan_formatted)
 
+                if cur_step_lbl and not (len(steps) == 1 and steps[0].get("action") == "reply"):
+                    self.show_reply(f"▶️ **{cur_step_lbl}**")
+
                 messages.append({"role": "assistant", "content": cleaned})
                 observations = []
+                gui_action_ran = False
+
                 for step in steps:
                     if self.stop_event.is_set():
                         return
+                    act_type = step.get("action", "")
+                    if act_type in ("open_app", "switch_window", "mouse_click", "keyboard_type", "keyboard_press", "screen_click_text", "navigate_to_target"):
+                        gui_action_ran = True
                     obs = self._safe_execute(step, original_user_task=cmd)
                     if obs:
-                        observations.append(f"[{step.get('action')}] {obs}")
+                        observations.append(f"[{act_type}] {obs}")
+
                 if data.get("done", True) is not False:
                     return
-                feedback = "\n".join(observations) or "(steps ran with no output)"
+
+                # If a GUI navigation/window action ran and more steps remain, auto-append screen coordinates & visual state
+                if gui_action_ran and not self.stop_event.is_set():
+                    time.sleep(0.6)
+                    screen_obs = self._capture_screen_observation_for_brain("After GUI action")
+                    observations.append(f"[auto_screen_vision] {screen_obs[:1800]}")
+
+                feedback = "\n".join(observations) or "(step ran with no output)"
                 messages.append({
                     "role": "user",
                     "content": (
                         f"Observation (Step {iteration + 1} Result):\n{feedback[:4000]}\n\n"
-                        "If the user answered a dialog above, use their answer to proceed with the next steps. "
-                        "If any step failed above, regenerate a corrected step and continue."
+                        "If the step failed or produced an error above, regenerate the step with a fix. "
+                        "Otherwise, proceed with the next step in your plan."
                     )
                 })
                 if len(messages) > 16:
@@ -4619,25 +4483,40 @@ class DesktopAgentWindow(QMainWindow):
         txt = s.get("text", "")
         self.show_reply(txt)
 
-    def act_prompt_dialog(self, s):
+    def act_ask_clarification(self, s):
         """
-        Opens a clarification dialog (e.g., 'Which browser should I check, sir?')
-        and returns the user's input to the AI Brain so it can continue step-by-step.
+        Pops up an interactive dialog box when the AI needs clarification (e.g. 'Which browser, sir?'),
+        records the user's answer, displays it in chat, and returns it to the AI Brain to continue.
         """
-        title = s.get("title") or "Clarification Needed"
-        question = s.get("question") or s.get("message") or "Please provide input:"
+        title = s.get("title") or "A.R.C Clarification Needed"
+        question = s.get("question") or s.get("text") or "Please provide input to continue:"
         options = s.get("options") or []
-        ans = self.ask_prompt_dialog(title, question, options)
-        if not ans:
+        field_name = s.get("field") or "user_answer"
+
+        fields = [{
+            "name": field_name,
+            "label": question,
+            "type": "choice" if options else "text",
+            "options": options,
+            "required": True
+        }]
+        res = self.ask_form(title, fields)
+        if res is None:
             self.stop_event.set()
             return "User cancelled clarification dialog."
-        self.session_memory["last_dialog_answer"] = ans
-        return f"User answered in dialog: {ans!r}"
+        ans_val = res.get(field_name, "")
+        self.session_memory[field_name] = ans_val
+        self.show_reply(f"💬 Clarified (`{question}`): **{ans_val}**")
+        return f"User answered '{ans_val}' to question '{question}'. Now proceed with the next step for '{ans_val}'."
 
-    def act_send_context_to_brain(self, s):
-        """Asks the user whether to send diagnostic context as Text or Image (Screenshot) and returns it to the AI."""
-        reason = s.get("reason") or "AI requested terminal / screen diagnostic check"
-        return self._ask_and_send_diagnostic_context(reason)
+    def act_ask_error_report_mode(self, s):
+        step_name = s.get("step_name") or "Current Step"
+        err_txt = s.get("error_text") or ""
+        return self.ask_error_report_mode(step_name, err_txt)
+
+    def act_capture_and_inspect_screen(self, s):
+        reason = s.get("reason") or "Inspect screen state and coordinates"
+        return self._capture_screen_observation_for_brain(reason)
 
     def act_write_and_run_python(self, s):
         code = s.get("code", "")
@@ -4931,7 +4810,10 @@ class DesktopAgentWindow(QMainWindow):
             if not self.confirm(f"Allow the agent to run this command in the bottom terminal?\n\n{cmd}"):
                 return "User denied the command."
 
-        out = self.execute_in_bottom_terminal(cmd, ask_on_error=True)
+        exit_code, out = self.execute_in_bottom_terminal(cmd)
+        if exit_code != 0:
+            # Prompt user whether to send text error, screenshot image, or both so AI Brain can fix and regenerate the step
+            return self.ask_error_report_mode(f"Terminal command failed (Exit {exit_code}): {cmd}", out)
         return out
 
     def act_open_app(self, s):
@@ -4942,7 +4824,7 @@ class DesktopAgentWindow(QMainWindow):
         if CURRENT_OS == "Linux":
             low = app.lower()
             candidates = [app, low, low.replace(" ", "-")]
-            if low in ("brave", "brave browser"):
+            if low == "brave":
                 candidates = ["brave-browser", "brave", "flatpak run com.brave.Browser"]
             elif low in ("chrome", "google chrome"):
                 candidates = ["google-chrome", "chromium", "chromium-browser"]
@@ -4951,19 +4833,19 @@ class DesktopAgentWindow(QMainWindow):
                 bin_name = cand.split()[0]
                 if shutil.which(bin_name):
                     term_cmd = f"nohup {cand} >/dev/null 2>&1 &"
-                    self.execute_in_bottom_terminal(term_cmd, timeout=4.0, ask_on_error=False)
+                    _code, _out = self.execute_in_bottom_terminal(term_cmd, timeout=4.0)
                     self.show_reply(f"Launched `{cand}` via the bottom terminal.")
                     return f"Executed `{term_cmd}` in bottom terminal."
 
         if CURRENT_OS == "Windows":
             term_cmd = f"Start-Process \"{app}\""
-            self.execute_in_bottom_terminal(term_cmd, timeout=5.0, ask_on_error=False)
+            self.execute_in_bottom_terminal(term_cmd, timeout=5.0)
             self.show_reply(f"Launched `{app}` via the bottom terminal.")
             return f"Executed `{term_cmd}` in bottom terminal."
 
         if CURRENT_OS == "macOS":
             term_cmd = f"open -a \"{app}\""
-            self.execute_in_bottom_terminal(term_cmd, timeout=5.0, ask_on_error=False)
+            self.execute_in_bottom_terminal(term_cmd, timeout=5.0)
             self.show_reply(f"Launched `{app}` via the bottom terminal.")
             return f"Executed `{term_cmd}` in bottom terminal."
 
@@ -5059,7 +4941,7 @@ class DesktopAgentWindow(QMainWindow):
         hits = self.screen.find_text(phrase)
         idx = int(s.get("index", 0))
         if not hits or idx >= len(hits):
-            return f"'{phrase}' not found on screen."
+            return self.ask_error_report_mode(f"Screen text '{phrase}' not found", f"Could not locate '{phrase}' via OCR.")
         btn = s.get("button", "left")
         clicks = int(s.get("clicks", 1))
         self.screen.click(hits[idx], clicks=clicks, button=btn)
@@ -5082,7 +4964,7 @@ class DesktopAgentWindow(QMainWindow):
         return self.act_screen_find(s)
 
     def act_ask_user(self, s):
-        fields = [f for f in s.get("fields", []) if f.get("name") and f["name"] not in self.session_memory]
+        fields = [f for f in s.get("fields", []) if f.get("name")]
         if not fields:
             return "All requested values are already known."
         res = self.ask_form(s.get("title", "Information needed"), fields)
